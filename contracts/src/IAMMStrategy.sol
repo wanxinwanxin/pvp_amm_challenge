@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {FeeStructure} from "./IFeeStructure.sol";
+
 /// @title Trade information passed to AMM strategies
 /// @notice Contains all data about an executed trade that strategies can use to adjust fees
 struct TradeInfo {
@@ -32,4 +34,22 @@ interface IAMMStrategy {
     /// @notice Get the strategy name for display
     /// @return Strategy name string
     function getName() external view returns (string memory);
+
+    /*//////////////////////////////////////////////////////////////
+                        OPTIONAL TIER-BASED FEES
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Check if this strategy supports piecewise fee structures
+    /// @dev Strategies implementing tier-based fees should return true
+    /// @dev Default implementation in AMMStrategyBase returns false for backward compatibility
+    /// @return True if the strategy implements getFeeStructure(), false otherwise
+    function supportsFeeStructure() external view returns (bool);
+
+    /// @notice Get the complete fee structure with up to 3 tiers per direction
+    /// @dev Only called if supportsFeeStructure() returns true
+    /// @dev Allows strategies to specify size-dependent fees (e.g., 30bps for small trades, 10bps for large)
+    /// @dev Router will compute weighted average fees for near-optimal splitting
+    /// @param trade Current trade information (may be used to adjust tiers dynamically)
+    /// @return fee structure containing bid and ask tier arrays
+    function getFeeStructure(TradeInfo calldata trade) external returns (FeeStructure memory);
 }

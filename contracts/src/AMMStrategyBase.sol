@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {IAMMStrategy, TradeInfo} from "./IAMMStrategy.sol";
+import {FeeStructure, FeeTier} from "./IFeeStructure.sol";
 
 /// @title AMM Strategy Base Contract
 /// @notice Base contract that all user strategies must inherit from
@@ -123,5 +124,74 @@ abstract contract AMMStrategyBase is IAMMStrategy {
     function writeSlot(uint256 index, uint256 value) internal {
         require(index < 32, "Slot index out of bounds");
         slots[index] = value;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    TIER-BASED FEE DEFAULTS (OPTIONAL)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Default implementation: strategy does not support fee tiers
+    /// @dev Override and return true in strategies that implement getFeeStructure()
+    /// @return False by default for backward compatibility with constant-fee strategies
+    function supportsFeeStructure() external view virtual returns (bool) {
+        return false;
+    }
+
+    /// @notice Default implementation: reverts if called
+    /// @dev Strategies that override supportsFeeStructure() to return true MUST also override this
+    /// @dev This should never be called if supportsFeeStructure() returns false
+    /// @param trade Trade information (unused in default implementation)
+    /// @return Empty fee structure (never reached due to revert)
+    function getFeeStructure(TradeInfo calldata trade) external virtual returns (FeeStructure memory) {
+        revert("Strategy does not support fee structures");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        TIER HELPER FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Create a single fee tier
+    /// @param threshold Trade size threshold in WAD
+    /// @param feeBps Fee in basis points (e.g., 30 = 30bps = 0.3%)
+    /// @return FeeTier struct
+    function createTier(uint256 threshold, uint256 feeBps) internal pure returns (FeeTier memory) {
+        return FeeTier({
+            threshold: threshold,
+            fee: bpsToWad(feeBps)
+        });
+    }
+
+    /// @notice Create a symmetric fee structure (same tiers for bid and ask)
+    /// @param tier1 First tier (base, threshold should be 0)
+    /// @param tier2 Second tier (optional, set threshold to 0 if unused)
+    /// @param tier3 Third tier (optional, set threshold to 0 if unused)
+    /// @return Complete fee structure with symmetric bid/ask tiers
+    function createSymmetricFeeStructure(
+        FeeTier memory tier1,
+        FeeTier memory tier2,
+        FeeTier memory tier3
+    ) internal pure returns (FeeStructure memory) {
+        FeeStructure memory fs;
+
+        fs.bidTiers[0] = tier1;
+        fs.askTiers[0] = tier1;
+        fs.bidTierCount = 1;
+        fs.askTierCount = 1;
+
+        if (tier2.threshold > 0) {
+            fs.bidTiers[1] = tier2;
+            fs.askTiers[1] = tier2;
+            fs.bidTierCount = 2;
+            fs.askTierCount = 2;
+        }
+
+        if (tier3.threshold > 0) {
+            fs.bidTiers[2] = tier3;
+            fs.askTiers[2] = tier3;
+            fs.bidTierCount = 3;
+            fs.askTierCount = 3;
+        }
+
+        return fs;
     }
 }

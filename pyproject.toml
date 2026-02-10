@@ -16,7 +16,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.0.0",
+    "pytest-timeout>=2.0.0",
+    "pytest-benchmark>=4.0.0",
+]
 
 [project.scripts]
 amm-match = "amm_competition.cli:main"
@@ -24,3 +30,42 @@ amm-match = "amm_competition.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["amm_competition*"]
+
+[tool.pytest.ini_options]
+# Additional pytest configuration (also in pytest.ini)
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+
+[tool.coverage.run]
+# Coverage configuration
+source = ["amm_competition"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__pycache__/*",
+    "*/venv/*",
+    "*/.venv/*",
+]
+
+[tool.coverage.report]
+# Coverage report options
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+    "@abc.abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.xml]
+output = "coverage.xml"
