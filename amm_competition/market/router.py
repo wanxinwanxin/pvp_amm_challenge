@@ -27,7 +27,38 @@ class OrderRouter:
 
     For constant product AMMs (xy=k), the optimal split can be computed
     analytically rather than using numerical methods.
+
+    Supports tiered fee structures through iterative refinement: computes
+    effective fees at current split sizes, recomputes split, and repeats
+    until convergence (typically 2-3 iterations).
     """
+
+    def _compute_effective_fee(
+        self,
+        amm: AMM,
+        trade_size: Decimal,
+        is_buy: bool
+    ) -> float:
+        """Compute effective fee for given trade size and direction.
+
+        For constant-fee strategies, returns the constant fee.
+        For tiered-fee strategies, returns the weighted average effective fee.
+
+        Args:
+            amm: AMM to query
+            trade_size: Size of trade in appropriate units (X or Y)
+            is_buy: True for buy direction (ask_fee), False for sell (bid_fee)
+
+        Returns:
+            Effective fee rate as float for fast math
+        """
+        fees = amm.current_fees
+        if is_buy:
+            # Buying X (ask direction)
+            return float(fees.effective_ask_fee(trade_size))
+        else:
+            # Selling X (bid direction)
+            return float(fees.effective_bid_fee(trade_size))
 
     def compute_optimal_split_buy(
         self, amms: list[AMM], total_y: Decimal
@@ -46,8 +77,14 @@ class OrderRouter:
         A_i = sqrt(x_i * γ_i * y_i), r = A_1/A_2
         Δy_1* = (r * (y_2 + γ_2 * Y) - y_1) / (γ_1 + r * γ_2)
 
+        Tiered Fees (N ≤ 5):
+        - For constant-fee AMMs, uses the analytical solution above
+        - For tiered-fee AMMs, uses iterative refinement (2-3 iterations typical)
+        - For N > 2, uses pairwise approximation (near-optimal for N ≤ 5)
+        - Each pairwise split handles tiered fees through iterative convergence
+
         Args:
-            amms: List of AMMs to split across
+            amms: List of AMMs to split across (recommended N ≤ 5)
             total_y: Total Y amount to spend
 
         Returns:
@@ -63,7 +100,8 @@ class OrderRouter:
             return self._split_buy_two_amms(amms[0], amms[1], total_y)
 
         # For >2 AMMs, use iterative pairwise splitting
-        # (This is a simplification - true optimal would require solving simultaneously)
+        # Each pairwise split uses iterative refinement if any AMM has tiered fees
+        # This is an approximation but performs well for N ≤ 5
         remaining = total_y
         splits = []
         for i, amm in enumerate(amms[:-1]):
@@ -79,7 +117,108 @@ class OrderRouter:
     ) -> list[tuple[AMM, Decimal]]:
         """Compute optimal Y split between exactly two AMMs for buying X.
 
+        Supports tiered fee structures through iterative refinement:
+        1. Initial split using constant fees
+        2. Estimate X outputs from Y inputs
+        3. Compute effective fees based on X amounts
+        4. Recompute split with effective fees
+        5. Check convergence and repeat
+
         Uses float internally for performance (sqrt, division are 10-50x faster).
+        """
+        # Check if either AMM has tiered fees
+        has_tiers = (amm1.current_fees.ask_tiers is not None or
+                     amm2.current_fees.ask_tiers is not None)
+
+        # If both have constant fees, use fast path
+        if not has_tiers:
+            return self._split_buy_two_amms_constant(amm1, amm2, total_y)
+
+        # Iterative refinement for tiered fees
+        x1, y1 = float(amm1.reserve_x), float(amm1.reserve_y)
+        x2, y2 = float(amm2.reserve_x), float(amm2.reserve_y)
+        Y = float(total_y)
+
+        # Start with constant fee split
+        initial_split = self._split_buy_two_amms_constant(amm1, amm2, total_y)
+        y1_amount = float(initial_split[0][1])
+        y2_amount = float(initial_split[1][1])
+
+        # Convergence parameters
+        max_iterations = 5
+        tolerance = 0.001  # 0.1% relative change
+
+        for iteration in range(max_iterations):
+            # Estimate X outputs from Y inputs using constant product formula
+            # Δx = x * γ * Δy / (y + γ * Δy)
+            # We need effective fees based on X output, but to get X we need fees
+            # Estimate X using current fee estimates
+            if y1_amount > 0:
+                # Estimate output for AMM1
+                gamma1_est = 1.0 - float(amm1.current_fees.ask_fee)
+                x1_output_est = x1 * gamma1_est * y1_amount / (y1 + gamma1_est * y1_amount)
+            else:
+                x1_output_est = 0.0
+
+            if y2_amount > 0:
+                # Estimate output for AMM2
+                gamma2_est = 1.0 - float(amm2.current_fees.ask_fee)
+                x2_output_est = x2 * gamma2_est * y2_amount / (y2 + gamma2_est * y2_amount)
+            else:
+                x2_output_est = 0.0
+
+            # Compute effective fees based on estimated X outputs
+            f1_eff = self._compute_effective_fee(amm1, Decimal(str(x1_output_est)), is_buy=True)
+            f2_eff = self._compute_effective_fee(amm2, Decimal(str(x2_output_est)), is_buy=True)
+
+            # Recompute split with effective fees
+            gamma1 = 1.0 - f1_eff
+            gamma2 = 1.0 - f2_eff
+
+            A1 = math.sqrt(x1 * gamma1 * y1)
+            A2 = math.sqrt(x2 * gamma2 * y2)
+
+            if A2 == 0:
+                y1_new = Y
+                y2_new = 0.0
+            else:
+                r = A1 / A2
+                numerator = r * (y2 + gamma2 * Y) - y1
+                denominator = gamma1 + r * gamma2
+
+                if denominator == 0:
+                    y1_new = Y / 2.0
+                else:
+                    y1_new = numerator / denominator
+
+                # Clamp to valid range
+                y1_new = max(0.0, min(Y, y1_new))
+                y2_new = Y - y1_new
+
+            # Check convergence: max relative change < tolerance
+            max_change = 0.0
+            if Y > 0:
+                max_change = max(
+                    abs(y1_new - y1_amount) / Y,
+                    abs(y2_new - y2_amount) / Y
+                )
+
+            # Update for next iteration
+            y1_amount = y1_new
+            y2_amount = y2_new
+
+            # Break if converged
+            if max_change < tolerance:
+                break
+
+        return [(amm1, Decimal(str(y1_amount))), (amm2, Decimal(str(y2_amount)))]
+
+    def _split_buy_two_amms_constant(
+        self, amm1: AMM, amm2: AMM, total_y: Decimal
+    ) -> list[tuple[AMM, Decimal]]:
+        """Compute optimal Y split for constant fees (fast path).
+
+        This is the original algorithm extracted for reuse.
         """
         # Convert to float for fast math
         x1, y1 = float(amm1.reserve_x), float(amm1.reserve_y)
@@ -134,8 +273,14 @@ class OrderRouter:
         B_i = sqrt(y_i * γ_i * x_i), r = B_1/B_2
         Δx_1* = (r * (x_2 + γ_2 * X) - x_1) / (γ_1 + r * γ_2)
 
+        Tiered Fees (N ≤ 5):
+        - For constant-fee AMMs, uses the analytical solution above
+        - For tiered-fee AMMs, uses iterative refinement (2-3 iterations typical)
+        - For N > 2, uses pairwise approximation (near-optimal for N ≤ 5)
+        - Each pairwise split handles tiered fees through iterative convergence
+
         Args:
-            amms: List of AMMs to split across
+            amms: List of AMMs to split across (recommended N ≤ 5)
             total_x: Total X amount to sell
 
         Returns:
@@ -151,6 +296,8 @@ class OrderRouter:
             return self._split_sell_two_amms(amms[0], amms[1], total_x)
 
         # For >2 AMMs, use iterative pairwise splitting
+        # Each pairwise split uses iterative refinement if any AMM has tiered fees
+        # This is an approximation but performs well for N ≤ 5
         remaining = total_x
         splits = []
         for i, amm in enumerate(amms[:-1]):
@@ -165,7 +312,90 @@ class OrderRouter:
     ) -> list[tuple[AMM, Decimal]]:
         """Compute optimal X split between exactly two AMMs for selling X.
 
+        Supports tiered fee structures through iterative refinement:
+        1. Initial split using constant fees
+        2. Compute effective fees based on X amounts (trader sells X directly)
+        3. Recompute split with effective fees
+        4. Check convergence and repeat
+
         Uses float internally for performance (sqrt, division are 10-50x faster).
+        """
+        # Check if either AMM has tiered fees
+        has_tiers = (amm1.current_fees.bid_tiers is not None or
+                     amm2.current_fees.bid_tiers is not None)
+
+        # If both have constant fees, use fast path
+        if not has_tiers:
+            return self._split_sell_two_amms_constant(amm1, amm2, total_x)
+
+        # Iterative refinement for tiered fees
+        x1, y1 = float(amm1.reserve_x), float(amm1.reserve_y)
+        x2, y2 = float(amm2.reserve_x), float(amm2.reserve_y)
+        X = float(total_x)
+
+        # Start with constant fee split
+        initial_split = self._split_sell_two_amms_constant(amm1, amm2, total_x)
+        x1_amount = float(initial_split[0][1])
+        x2_amount = float(initial_split[1][1])
+
+        # Convergence parameters
+        max_iterations = 5
+        tolerance = 0.001  # 0.1% relative change
+
+        for iteration in range(max_iterations):
+            # For sell direction, we know X amounts directly (trader sells X)
+            # Compute effective fees based on X amounts
+            f1_eff = self._compute_effective_fee(amm1, Decimal(str(x1_amount)), is_buy=False)
+            f2_eff = self._compute_effective_fee(amm2, Decimal(str(x2_amount)), is_buy=False)
+
+            # Recompute split with effective fees
+            gamma1 = 1.0 - f1_eff
+            gamma2 = 1.0 - f2_eff
+
+            B1 = math.sqrt(y1 * gamma1 * x1)
+            B2 = math.sqrt(y2 * gamma2 * x2)
+
+            if B2 == 0:
+                x1_new = X
+                x2_new = 0.0
+            else:
+                r = B1 / B2
+                numerator = r * (x2 + gamma2 * X) - x1
+                denominator = gamma1 + r * gamma2
+
+                if denominator == 0:
+                    x1_new = X / 2.0
+                else:
+                    x1_new = numerator / denominator
+
+                # Clamp to valid range
+                x1_new = max(0.0, min(X, x1_new))
+                x2_new = X - x1_new
+
+            # Check convergence: max relative change < tolerance
+            max_change = 0.0
+            if X > 0:
+                max_change = max(
+                    abs(x1_new - x1_amount) / X,
+                    abs(x2_new - x2_amount) / X
+                )
+
+            # Update for next iteration
+            x1_amount = x1_new
+            x2_amount = x2_new
+
+            # Break if converged
+            if max_change < tolerance:
+                break
+
+        return [(amm1, Decimal(str(x1_amount))), (amm2, Decimal(str(x2_amount)))]
+
+    def _split_sell_two_amms_constant(
+        self, amm1: AMM, amm2: AMM, total_x: Decimal
+    ) -> list[tuple[AMM, Decimal]]:
+        """Compute optimal X split for constant fees (fast path).
+
+        This is the original algorithm extracted for reuse.
         """
         # Convert to float for fast math
         x1, y1 = float(amm1.reserve_x), float(amm1.reserve_y)

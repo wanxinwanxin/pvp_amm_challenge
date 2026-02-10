@@ -50,9 +50,13 @@ class EVMStrategyExecutor:
     # afterInitialize(uint256,uint256) -> 0x837aef47
     # afterSwap((bool,uint256,uint256,uint256,uint256,uint256)) -> 0xc2babb57
     # getName() -> 0x17d7de7c
+    # supportsFeeStructure() -> 0xa0ce5bb9
+    # getFeeStructure((bool,uint256,uint256,uint256,uint256,uint256)) -> 0x0fa2e039
     SELECTOR_AFTER_INITIALIZE = bytes.fromhex("837aef47")
     SELECTOR_AFTER_SWAP = bytes.fromhex("c2babb57")
     SELECTOR_GET_NAME = bytes.fromhex("17d7de7c")
+    SELECTOR_SUPPORTS_FEE_STRUCTURE = bytes.fromhex("a0ce5bb9")
+    SELECTOR_GET_FEE_STRUCTURE = bytes.fromhex("0fa2e039")
 
     def __init__(self, bytecode: bytes, abi: Optional[list] = None):
         """Initialize the executor with compiled bytecode.
@@ -275,6 +279,102 @@ class EVMStrategyExecutor:
 
         except Exception:
             return "Unknown"
+
+    def supports_fee_structure(self) -> bool:
+        """Check if strategy supports piecewise fee structures.
+
+        Returns:
+            True if strategy implements getFeeStructure(), False otherwise
+        """
+        try:
+            result = self.evm.message_call(
+                caller=self.CALLER_ADDRESS,
+                to=self.deployed_address,
+                calldata=self.SELECTOR_SUPPORTS_FEE_STRUCTURE,
+                value=0,
+                gas=50_000,  # Should be very cheap
+            )
+
+            # Decode bool return value (32 bytes, 0 or 1)
+            if len(result) < 32:
+                return False
+
+            return self._decode_uint256(result, 0) != 0
+
+        except Exception:
+            # If call fails, strategy doesn't support tiers
+            return False
+
+    def get_fee_structure(self, trade: TradeInfo) -> Optional[Tuple[list, list]]:
+        """Get fee structure from strategy.
+
+        Args:
+            trade: Current trade info (may be dummy for initial query)
+
+        Returns:
+            Tuple of (bid_tiers, ask_tiers) where each is list of (threshold, fee) tuples,
+            or None if strategy doesn't support tiers or call fails
+        """
+        try:
+            # Encode TradeInfo as calldata
+            # struct TradeInfo: (bool isBuy, uint256 amountX, uint256 amountY,
+            #                    uint256 timestamp, uint256 reserveX, uint256 reserveY)
+            wad = self.WAD
+            calldata = (
+                self.SELECTOR_GET_FEE_STRUCTURE
+                + self._encode_bool(trade.side == "buy")
+                + self._encode_uint256(int(trade.amount_x * wad))
+                + self._encode_uint256(int(trade.amount_y * wad))
+                + self._encode_uint256(trade.timestamp)
+                + self._encode_uint256(int(trade.reserve_x * wad))
+                + self._encode_uint256(int(trade.reserve_y * wad))
+            )
+
+            result = self.evm.message_call(
+                caller=self.CALLER_ADDRESS,
+                to=self.deployed_address,
+                calldata=calldata,
+                value=0,
+                gas=self.GAS_LIMIT_TRADE,
+            )
+
+            # Decode FeeStructure return value
+            # FeeStructure: FeeTier[3] bidTiers, FeeTier[3] askTiers, uint8 bidTierCount, uint8 askTierCount
+            # Each FeeTier: uint256 threshold, uint256 fee
+            # Total: 3*2*32 (bidTiers) + 3*2*32 (askTiers) + 32 (bidTierCount) + 32 (askTierCount) = 448 bytes
+            if len(result) < 448:
+                return None
+
+            # Parse bid tiers (offset 0-191)
+            bid_tiers = []
+            for i in range(3):
+                offset = i * 64
+                threshold_wad = self._decode_uint256(result, offset)
+                fee_wad = self._decode_uint256(result, offset + 32)
+                bid_tiers.append((threshold_wad, fee_wad))
+
+            # Parse ask tiers (offset 192-383)
+            ask_tiers = []
+            for i in range(3):
+                offset = 192 + i * 64
+                threshold_wad = self._decode_uint256(result, offset)
+                fee_wad = self._decode_uint256(result, offset + 32)
+                ask_tiers.append((threshold_wad, fee_wad))
+
+            # Parse tier counts (offset 384 and 416)
+            bid_tier_count = self._decode_uint256(result, 384)
+            ask_tier_count = self._decode_uint256(result, 416)
+
+            # Trim to active tiers only
+            bid_tiers = bid_tiers[:bid_tier_count]
+            ask_tiers = ask_tiers[:ask_tier_count]
+
+            # Return raw WAD values (adapter will convert to Decimal)
+            return (bid_tiers, ask_tiers)
+
+        except Exception:
+            # If call fails, return None
+            return None
 
     def reset(self) -> None:
         """Reset the EVM state by redeploying the contract.

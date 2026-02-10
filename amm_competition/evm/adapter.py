@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Optional, Tuple
 
 from amm_competition.core.interfaces import AMMStrategy
-from amm_competition.core.trade import FeeQuote, TradeInfo
+from amm_competition.core.trade import FeeQuote, FeeTier, TradeInfo
 from amm_competition.evm.executor import EVMStrategyExecutor, EVMExecutionResult, _WAD_DECIMAL
 from amm_competition.evm.compiler import SolidityCompiler, CompilationResult
 from amm_competition.evm.validator import SolidityValidator, ValidationResult
@@ -62,6 +62,63 @@ class EVMStrategyAdapter(AMMStrategy):
             (self._bytecode, self._abi, self._name_override),
         )
 
+    def _load_fee_structure(self, initial_x: Decimal, initial_y: Decimal) -> Tuple[Optional[list[FeeTier]], Optional[list[FeeTier]]]:
+        """Load fee structure from EVM strategy if supported.
+
+        Workflow:
+        1. Check supportsFeeStructure() on strategy
+        2. If false, return None (use constant fees)
+        3. If true, call getFeeStructure(dummy_trade)
+        4. Parse FeeStructure from return data
+        5. Build Python FeeTier lists from WAD values
+
+        Args:
+            initial_x: Initial X reserves (for dummy trade)
+            initial_y: Initial Y reserves (for dummy trade)
+
+        Returns:
+            Tuple of (bid_tiers, ask_tiers) or (None, None) if constant fees
+        """
+        # Check if strategy supports tiered fees
+        if not self._executor.supports_fee_structure():
+            return (None, None)
+
+        # Create dummy trade for initial query
+        dummy_trade = TradeInfo(
+            side="buy",
+            amount_x=Decimal(0),
+            amount_y=Decimal(0),
+            timestamp=0,
+            reserve_x=initial_x,
+            reserve_y=initial_y,
+        )
+
+        # Load tier structure from EVM
+        tier_data = self._executor.get_fee_structure(dummy_trade)
+        if tier_data is None:
+            return (None, None)
+
+        bid_tiers_wad, ask_tiers_wad = tier_data
+
+        # Convert from WAD to Decimal and build FeeTier lists
+        wad = Decimal(_WAD_DECIMAL)
+        bid_tiers = [
+            FeeTier(
+                threshold=Decimal(threshold) / wad,
+                fee=Decimal(fee) / wad
+            )
+            for threshold, fee in bid_tiers_wad
+        ]
+        ask_tiers = [
+            FeeTier(
+                threshold=Decimal(threshold) / wad,
+                fee=Decimal(fee) / wad
+            )
+            for threshold, fee in ask_tiers_wad
+        ]
+
+        return (bid_tiers, ask_tiers)
+
     def after_initialize(self, initial_x: Decimal, initial_y: Decimal) -> FeeQuote:
         """Initialize the strategy with starting reserves.
 
@@ -70,7 +127,7 @@ class EVMStrategyAdapter(AMMStrategy):
             initial_y: Starting Y reserve amount
 
         Returns:
-            FeeQuote with initial bid/ask fees
+            FeeQuote with initial bid/ask fees and optional tier structures
 
         Raises:
             RuntimeError: If EVM execution fails
@@ -83,9 +140,18 @@ class EVMStrategyAdapter(AMMStrategy):
         self.total_gas_used += result.gas_used
         self.call_count += 1
 
+        # Get constant fees
+        bid_fee = self._clamp_fee_decimal(result.bid_fee)
+        ask_fee = self._clamp_fee_decimal(result.ask_fee)
+
+        # Try to load tier structure if strategy supports it
+        bid_tiers, ask_tiers = self._load_fee_structure(initial_x, initial_y)
+
         return FeeQuote(
-            bid_fee=self._clamp_fee_decimal(result.bid_fee),
-            ask_fee=self._clamp_fee_decimal(result.ask_fee),
+            bid_fee=bid_fee,
+            ask_fee=ask_fee,
+            bid_tiers=bid_tiers,
+            ask_tiers=ask_tiers,
         )
 
     def after_swap(self, trade: TradeInfo) -> FeeQuote:
