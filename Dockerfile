@@ -1,46 +1,70 @@
-# Dockerfile for PVP AMM Challenge - Railway Deployment
+# Multi-stage Dockerfile for PVP AMM Challenge - Railway Deployment
+# This reduces final image size by ~2GB and speeds up deployment
 
-FROM python:3.11-slim
+# ============================================================================
+# Stage 1: Build Rust wheel
+# ============================================================================
+FROM python:3.11-slim AS rust-builder
 
-# Install system dependencies
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust (needed for amm_sim_rs)
+# Install Rust toolchain
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Set working directory
+WORKDIR /build
+
+# Copy only Rust project files
+COPY amm_sim_rs ./amm_sim_rs
+
+# Build Rust wheel
+RUN pip install --no-cache-dir maturin && \
+    cd amm_sim_rs && \
+    maturin build --release
+
+# ============================================================================
+# Stage 2: Final runtime image
+# ============================================================================
+FROM python:3.11-slim
+
+# Install only runtime dependencies (curl for health checks)
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Copy project files
-COPY . .
+# Copy project files (excluding Rust source since we have the wheel)
+COPY requirements.txt requirements-pvp.txt pyproject.toml setup.py ./
+COPY amm_competition ./amm_competition
+COPY contracts ./contracts
+COPY pvp_app ./pvp_app
+COPY .streamlit ./.streamlit
+COPY start.sh ./start.sh
 
-# Install Python dependencies for the base project
-RUN pip install --no-cache-dir --upgrade pip
-RUN pip install --no-cache-dir numpy  # Pre-install numpy for faster build
+# Make startup script executable
+RUN chmod +x start.sh
 
-# Build and install the Rust simulation engine
-RUN cd amm_sim_rs && \
-    pip install --no-cache-dir maturin && \
-    maturin build --release && \
-    pip install --no-cache-dir target/wheels/*.whl
+# Copy pre-built Rust wheel from builder stage
+COPY --from=rust-builder /build/amm_sim_rs/target/wheels/*.whl /tmp/
 
-# Install Python package and PVP dependencies
-RUN pip install --no-cache-dir -e .
-RUN pip install --no-cache-dir -r requirements-pvp.txt
+# Install all Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir numpy && \
+    pip install --no-cache-dir /tmp/*.whl && \
+    pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir -r requirements-pvp.txt && \
+    rm -rf /tmp/*.whl
 
-# Create data directory
-RUN mkdir -p /app/data
+# Create data directory with proper permissions
+RUN mkdir -p /app/data && chmod 755 /app/data
 
 # Expose Streamlit port (Railway will use dynamic $PORT)
 EXPOSE 8501
-
-# Note: Railway handles health checks via railway.toml
-# No HEALTHCHECK needed here to avoid port conflicts
 
 # Run Streamlit app via startup script
 CMD ["./start.sh"]
