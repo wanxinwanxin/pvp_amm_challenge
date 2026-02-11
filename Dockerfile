@@ -15,14 +15,15 @@ COPY amm_sim_rs/Cargo.toml amm_sim_rs/Cargo.lock* ./amm_sim_rs/
 COPY amm_sim_rs/pyproject.toml ./amm_sim_rs/
 
 # Create dummy source to build dependencies
-RUN mkdir -p amm_sim_rs/src && \
-    echo "fn main() {}" > amm_sim_rs/src/lib.rs
+RUN mkdir -p amm_sim_rs/src amm_sim_rs/benches && \
+    echo "pub fn dummy() {}" > amm_sim_rs/src/lib.rs && \
+    echo "fn main() {}" > amm_sim_rs/benches/simulation_bench.rs
 
 # Pre-build dependencies (this layer caches 249 crates)
 RUN cd amm_sim_rs && cargo build --profile release-ci
 
 # Remove dummy source
-RUN rm -rf amm_sim_rs/src
+RUN rm -rf amm_sim_rs/src amm_sim_rs/benches
 
 # Copy real source code
 COPY amm_sim_rs/src ./amm_sim_rs/src
