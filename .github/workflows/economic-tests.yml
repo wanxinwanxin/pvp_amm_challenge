@@ -307,3 +307,64 @@ jobs:
         run: |
           mypy tests/ amm_competition/ --ignore-missing-imports
         continue-on-error: true
+
+  # ==========================================================================
+  # Docker Build Verification
+  # ==========================================================================
+
+  docker-build:
+    name: Docker Build Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: pvp-ci-test:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/pvp-image.tar
+        timeout-minutes: 12
+
+      - name: Load and test image
+        run: |
+          docker load --input /tmp/pvp-image.tar
+          docker tag pvp-ci-test:${{ github.sha }} pvp-test:latest
+
+      - name: Verify Python import
+        run: |
+          docker run --rm pvp-test:latest python -c "
+          import amm_sim_rs
+          from amm_competition.core.amm import AMM
+          print('✓ Import verification passed')
+          "
+
+      - name: Verify application startup
+        run: |
+          docker run -d --name pvp-startup-test -p 8501:8501 pvp-test:latest
+
+          for i in {1..12}; do
+            if docker exec pvp-startup-test curl -f http://localhost:8501/_stcore/health; then
+              echo "✓ Application started"
+              docker stop pvp-startup-test
+              exit 0
+            fi
+            echo "Waiting ($i/12)..."
+            sleep 5
+          done
+
+          echo "❌ Startup timeout"
+          docker logs pvp-startup-test
+          docker stop pvp-startup-test
+          exit 1
+        timeout-minutes: 2
