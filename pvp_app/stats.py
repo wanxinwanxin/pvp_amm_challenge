@@ -11,29 +11,30 @@ class StatsCalculator:
         self.db = db
 
     def get_strategy_stats(self, strategy_id: int) -> Dict:
-        """Calculate comprehensive stats for a strategy."""
-        matches = self.db.get_strategy_matches(strategy_id)
+        """Calculate comprehensive stats for a strategy (includes both legacy and n-way matches)."""
+        # Get legacy head-to-head matches
+        legacy_matches = self.db.get_strategy_matches(strategy_id)
 
-        if not matches:
-            return {
-                'total_matches': 0,
-                'wins': 0,
-                'losses': 0,
-                'draws': 0,
-                'win_rate': 0.0,
-                'avg_edge': 0.0,
-                'best_edge': 0.0,
-                'worst_edge': 0.0,
-                'total_simulations': 0
-            }
+        # Get n-way matches
+        n_way_matches = self.db.get_strategy_n_way_matches(strategy_id)
 
+        # Initialize stats
         wins = 0
         losses = 0
         draws = 0
+        first_place = 0
+        second_place = 0
+        third_place = 0
         total_edge = 0.0
         edges = []
+        total_simulations = 0
+        total_matches = 0
 
-        for match in matches:
+        # Process legacy matches
+        for match in legacy_matches:
+            total_matches += 1
+            total_simulations += match['n_simulations']
+
             # Determine if this strategy was A or B
             is_strategy_a = match['strategy_a_id'] == strategy_id
 
@@ -57,8 +58,63 @@ class StatsCalculator:
             total_edge += edge
             edges.append(edge)
 
-        total_matches = len(matches)
+        # Process n-way matches
+        for match in n_way_matches:
+            total_matches += 1
+            total_simulations += match['n_simulations']
+
+            # Get this strategy's participant record
+            match_details = self.db.get_n_way_match(match['id'])
+            if match_details:
+                for participant in match_details['participants']:
+                    if participant['strategy_id'] == strategy_id:
+                        placement = participant['placement']
+                        edge = participant['avg_edge']
+
+                        # Count placements
+                        if placement == 1:
+                            first_place += 1
+                            wins += 1  # 1st place counts as a win
+                        elif placement == 2:
+                            second_place += 1
+                        elif placement == 3:
+                            third_place += 1
+                        else:
+                            losses += 1  # 4th+ place counts as loss
+
+                        total_edge += edge
+                        edges.append(edge)
+                        break
+
+        if total_matches == 0:
+            return {
+                'total_matches': 0,
+                'wins': 0,
+                'losses': 0,
+                'draws': 0,
+                'win_rate': 0.0,
+                'avg_edge': 0.0,
+                'best_edge': 0.0,
+                'worst_edge': 0.0,
+                'total_simulations': 0,
+                'first_place': 0,
+                'second_place': 0,
+                'third_place': 0,
+                'avg_placement': 0.0,
+                'points': 0
+            }
+
         win_rate = wins / total_matches if total_matches > 0 else 0.0
+
+        # Calculate points (3/2/1 scoring)
+        points = first_place * 3 + second_place * 2 + third_place * 1
+
+        # Calculate average placement (only for n-way matches)
+        if n_way_matches:
+            total_placement = first_place * 1 + second_place * 2 + third_place * 3 + (len(n_way_matches) - first_place - second_place - third_place) * 4
+            avg_placement = total_placement / len(n_way_matches)
+        else:
+            avg_placement = 0.0
 
         return {
             'total_matches': total_matches,
@@ -69,7 +125,12 @@ class StatsCalculator:
             'avg_edge': total_edge / total_matches if total_matches > 0 else 0.0,
             'best_edge': max(edges) if edges else 0.0,
             'worst_edge': min(edges) if edges else 0.0,
-            'total_simulations': sum(m['n_simulations'] for m in matches)
+            'total_simulations': total_simulations,
+            'first_place': first_place,
+            'second_place': second_place,
+            'third_place': third_place,
+            'avg_placement': avg_placement,
+            'points': points
         }
 
     def get_head_to_head(self, strategy_a_id: int, strategy_b_id: int) -> Dict:
@@ -127,7 +188,7 @@ class StatsCalculator:
         Get leaderboard of strategies.
 
         Args:
-            sort_by: 'win_rate', 'matches', 'avg_edge'
+            sort_by: 'win_rate', 'matches', 'avg_edge', 'points', 'avg_placement'
             limit: Max number of strategies to return
 
         Returns:
@@ -156,6 +217,11 @@ class StatsCalculator:
             leaderboard.sort(key=lambda x: x['total_matches'], reverse=True)
         elif sort_by == 'avg_edge':
             leaderboard.sort(key=lambda x: x['avg_edge'], reverse=True)
+        elif sort_by == 'points':
+            leaderboard.sort(key=lambda x: (x['points'], x['first_place']), reverse=True)
+        elif sort_by == 'avg_placement':
+            # Lower placement is better, so no reverse
+            leaderboard.sort(key=lambda x: (x['avg_placement'] if x['avg_placement'] > 0 else 999, -x['total_matches']))
 
         return leaderboard[:limit]
 

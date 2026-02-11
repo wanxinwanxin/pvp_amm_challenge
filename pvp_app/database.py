@@ -86,6 +86,64 @@ class Database:
             )
         """)
 
+        # Create matches_v2 table for n-way matches
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS matches_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_type TEXT NOT NULL CHECK(match_type IN ('head_to_head', 'n_way')),
+                n_participants INTEGER NOT NULL CHECK(n_participants >= 2 AND n_participants <= 10),
+                n_simulations INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create match_participants table for n-way match results
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS match_participants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id INTEGER NOT NULL,
+                strategy_id INTEGER NOT NULL,
+                strategy_name TEXT NOT NULL,
+                placement INTEGER NOT NULL CHECK(placement > 0),
+                avg_edge REAL NOT NULL,
+                total_edge REAL NOT NULL,
+                wins INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (match_id) REFERENCES matches_v2(id) ON DELETE CASCADE,
+                FOREIGN KEY (strategy_id) REFERENCES strategies(id)
+            )
+        """)
+
+        # Create simulation_results_v2 table for n-way simulation data
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS simulation_results_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id INTEGER NOT NULL,
+                simulation_index INTEGER NOT NULL,
+                seed INTEGER NOT NULL,
+                strategy_id INTEGER NOT NULL,
+                edge REAL NOT NULL,
+                pnl REAL NOT NULL,
+                placement INTEGER NOT NULL,
+                steps_json TEXT,
+                FOREIGN KEY (match_id) REFERENCES matches_v2(id) ON DELETE CASCADE,
+                FOREIGN KEY (strategy_id) REFERENCES strategies(id)
+            )
+        """)
+
+        # Create indexes for performance
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_match_participants_match_id
+            ON match_participants(match_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_match_participants_strategy_id
+            ON match_participants(strategy_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_simulation_results_v2_match_id
+            ON simulation_results_v2(match_id)
+        """)
+
         conn.commit()
         conn.close()
 
@@ -317,3 +375,243 @@ class Database:
         if row:
             return dict(row)
         return None
+
+    # N-Way Match Methods
+
+    def add_n_way_match(
+        self,
+        match_data: Dict,
+        participant_results: List[Dict],
+        simulation_results: List[Dict]
+    ) -> int:
+        """
+        Add an n-way match with multiple participants.
+
+        Args:
+            match_data: Dict with keys: match_type, n_participants, n_simulations
+            participant_results: List of dicts with keys: strategy_id, strategy_name,
+                                placement, avg_edge, total_edge, wins
+            simulation_results: List of dicts with keys: simulation_index, seed, strategy_id,
+                               edge, pnl, placement, steps (optional)
+
+        Returns:
+            match_id: ID of the created match
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            # Insert match
+            cursor.execute("""
+                INSERT INTO matches_v2 (match_type, n_participants, n_simulations)
+                VALUES (?, ?, ?)
+            """, (
+                match_data['match_type'],
+                match_data['n_participants'],
+                match_data['n_simulations']
+            ))
+
+            match_id = cursor.lastrowid
+
+            # Insert participant results
+            for participant in participant_results:
+                cursor.execute("""
+                    INSERT INTO match_participants (
+                        match_id, strategy_id, strategy_name, placement,
+                        avg_edge, total_edge, wins
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    match_id,
+                    participant['strategy_id'],
+                    participant['strategy_name'],
+                    participant['placement'],
+                    participant['avg_edge'],
+                    participant['total_edge'],
+                    participant['wins']
+                ))
+
+            # Insert simulation results
+            for sim in simulation_results:
+                cursor.execute("""
+                    INSERT INTO simulation_results_v2 (
+                        match_id, simulation_index, seed, strategy_id,
+                        edge, pnl, placement, steps_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    match_id,
+                    sim['simulation_index'],
+                    sim['seed'],
+                    sim['strategy_id'],
+                    sim['edge'],
+                    sim['pnl'],
+                    sim['placement'],
+                    json.dumps(sim.get('steps', []))
+                ))
+
+            conn.commit()
+            return match_id
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+
+    def get_n_way_match(self, match_id: int) -> Optional[Dict]:
+        """
+        Get an n-way match by ID with all participants.
+
+        Returns:
+            Dict with match data and participants list, or None if not found
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Get match data
+        cursor.execute("SELECT * FROM matches_v2 WHERE id = ?", (match_id,))
+        match_row = cursor.fetchone()
+
+        if not match_row:
+            conn.close()
+            return None
+
+        match_data = dict(match_row)
+
+        # Get participants
+        cursor.execute("""
+            SELECT * FROM match_participants
+            WHERE match_id = ?
+            ORDER BY placement
+        """, (match_id,))
+
+        participant_rows = cursor.fetchall()
+        match_data['participants'] = [dict(row) for row in participant_rows]
+
+        conn.close()
+        return match_data
+
+    def get_n_way_match_simulations(self, match_id: int) -> List[Dict]:
+        """Get all simulation results for an n-way match, grouped by simulation."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM simulation_results_v2
+            WHERE match_id = ?
+            ORDER BY simulation_index, placement
+        """, (match_id,))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        results = []
+        for row in rows:
+            result = dict(row)
+            # Parse steps_json
+            if result.get('steps_json'):
+                result['steps'] = json.loads(result['steps_json'])
+            results.append(result)
+
+        return results
+
+    def get_match_type(self, match_id: int) -> Optional[str]:
+        """
+        Determine if a match is legacy (2-player) or n-way.
+
+        Returns:
+            'legacy' if in matches table
+            'head_to_head' or 'n_way' if in matches_v2 table
+            None if match not found
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Check matches_v2 first
+        cursor.execute("SELECT match_type FROM matches_v2 WHERE id = ?", (match_id,))
+        row = cursor.fetchone()
+
+        if row:
+            conn.close()
+            return row[0]  # 'head_to_head' or 'n_way'
+
+        # Check legacy matches table
+        cursor.execute("SELECT id FROM matches WHERE id = ?", (match_id,))
+        row = cursor.fetchone()
+
+        conn.close()
+
+        if row:
+            return 'legacy'
+
+        return None
+
+    def get_strategy_n_way_matches(self, strategy_id: int) -> List[Dict]:
+        """Get all n-way matches for a strategy (from matches_v2)."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT DISTINCT m.*
+            FROM matches_v2 m
+            JOIN match_participants mp ON m.id = mp.match_id
+            WHERE mp.strategy_id = ?
+            ORDER BY m.created_at DESC
+        """, (strategy_id,))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        return [dict(row) for row in rows]
+
+    def get_all_matches_combined(self, strategy_id: Optional[int] = None, limit: int = 10) -> List[Dict]:
+        """
+        Get matches from both legacy and v2 tables, optionally filtered by strategy.
+        Returns unified format with match_type indicator.
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        matches = []
+
+        # Get legacy matches
+        if strategy_id:
+            cursor.execute("""
+                SELECT *, 'legacy' as match_type FROM matches
+                WHERE strategy_a_id = ? OR strategy_b_id = ?
+                ORDER BY created_at DESC
+            """, (strategy_id, strategy_id))
+        else:
+            cursor.execute("""
+                SELECT *, 'legacy' as match_type FROM matches
+                ORDER BY created_at DESC
+            """)
+
+        legacy_matches = [dict(row) for row in cursor.fetchall()]
+        matches.extend(legacy_matches)
+
+        # Get v2 matches
+        if strategy_id:
+            cursor.execute("""
+                SELECT DISTINCT m.*, m.match_type as match_type_v2
+                FROM matches_v2 m
+                JOIN match_participants mp ON m.id = mp.match_id
+                WHERE mp.strategy_id = ?
+                ORDER BY m.created_at DESC
+            """, (strategy_id,))
+        else:
+            cursor.execute("""
+                SELECT *, match_type as match_type_v2 FROM matches_v2
+                ORDER BY created_at DESC
+            """)
+
+        v2_matches = [dict(row) for row in cursor.fetchall()]
+        matches.extend(v2_matches)
+
+        conn.close()
+
+        # Sort by created_at and limit
+        matches.sort(key=lambda x: x['created_at'], reverse=True)
+        return matches[:limit] if limit else matches

@@ -19,6 +19,16 @@ pub struct SimulationBatchConfig {
     pub n_workers: Option<usize>,
 }
 
+/// Configuration for a batch of n-way simulations.
+pub struct NWaySimulationBatchConfig {
+    /// Bytecodes for all strategies
+    pub strategy_bytecodes: Vec<Vec<u8>>,
+    /// List of simulation configs (one per simulation)
+    pub configs: Vec<SimulationConfig>,
+    /// Number of parallel workers (None = auto-detect)
+    pub n_workers: Option<usize>,
+}
+
 /// Run multiple simulations in parallel.
 pub fn run_simulations_parallel(
     batch_config: SimulationBatchConfig,
@@ -86,6 +96,73 @@ pub fn run_simulation(
 
     let mut engine = SimulationEngine::new(config);
     engine.run(submission, baseline)
+}
+
+/// Run multiple n-way simulations in parallel.
+pub fn run_n_way_simulations_parallel(
+    batch_config: NWaySimulationBatchConfig,
+) -> Result<BatchSimulationResult, SimulationError> {
+    // Validate we have at least 2 strategies
+    if batch_config.strategy_bytecodes.len() < 2 {
+        return Err(SimulationError::InvalidConfig(
+            "At least 2 strategies required for n-way match".to_string(),
+        ));
+    }
+
+    // Validate strategy count is within limits
+    if batch_config.strategy_bytecodes.len() > 10 {
+        return Err(SimulationError::InvalidConfig(
+            "Maximum 10 strategies allowed for n-way match".to_string(),
+        ));
+    }
+
+    // Configure thread pool
+    let n_workers = batch_config.n_workers.unwrap_or_else(|| {
+        rayon::current_num_threads().min(8)
+    });
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_workers)
+        .build()
+        .map_err(|e| SimulationError::InvalidConfig(format!("Failed to create thread pool: {}", e)))?;
+
+    // Clone bytecodes for sharing across workers
+    let strategy_bytecodes = batch_config.strategy_bytecodes;
+
+    // Run simulations in parallel
+    let results: Result<Vec<LightweightSimResult>, SimulationError> = pool.install(|| {
+        batch_config.configs
+            .into_par_iter()
+            .map(|config| {
+                // Create fresh EVM strategies for this worker
+                let strategies: Result<Vec<EVMStrategy>, SimulationError> = strategy_bytecodes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, bytecode)| {
+                        EVMStrategy::new(
+                            bytecode.clone(),
+                            format!("Strategy_{}", idx),
+                        ).map_err(|e| SimulationError::EVMError(e.to_string()))
+                    })
+                    .collect();
+
+                let strategies = strategies?;
+                let mut engine = SimulationEngine::new(config);
+                engine.run_n_way(strategies)
+            })
+            .collect()
+    });
+
+    let results = results?;
+
+    // Extract strategy names from first result
+    let strategies = if let Some(first) = results.first() {
+        first.strategies.clone()
+    } else {
+        Vec::new()
+    };
+
+    Ok(BatchSimulationResult { results, strategies })
 }
 
 #[cfg(test)]

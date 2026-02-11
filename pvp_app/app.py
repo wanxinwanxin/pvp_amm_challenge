@@ -445,33 +445,67 @@ if 'view_strategy_id' in st.session_state:
 elif page == "⚔️ Create Match":
     st.title("⚔️ Create New Match")
 
-    st.markdown("""
-    Select two strategies to compete head-to-head. Each strategy will run as a separate AMM,
-    competing for retail flow based on their fee schedules.
-    """)
-
     strategies = db.list_strategies()
 
     if len(strategies) < 2:
         st.warning("Need at least 2 strategies to create a match. Submit more strategies first!")
     else:
+        # Match type selection
+        match_type = st.radio(
+            "Match Type",
+            ["Head-to-Head (2 strategies)", "N-Way Match (3-10 strategies)"],
+            help="Head-to-head: Classic 1v1. N-way: Multiple strategies compete simultaneously."
+        )
+
+        is_n_way = match_type.startswith("N-Way")
+
+        if is_n_way:
+            st.markdown("""
+            Select 3-10 strategies to compete simultaneously. Strategies are ranked by placement
+            (1st, 2nd, 3rd, etc.) based on edge performance. Points: 1st=3pts, 2nd=2pts, 3rd=1pt.
+            """)
+        else:
+            st.markdown("""
+            Select two strategies to compete head-to-head. Each strategy runs as a separate AMM,
+            competing for retail flow based on their fee schedules.
+            """)
+
         strategy_options = {f"{s['name']} by {s['author']}": s['id'] for s in strategies}
 
-        col1, col2 = st.columns(2)
-
-        with col1:
-            strategy_a = st.selectbox(
-                "Select Strategy A",
+        if is_n_way:
+            # N-way match: multi-select
+            selected_strategies = st.multiselect(
+                "Select Strategies (3-10)",
                 options=strategy_options.keys(),
-                help="First strategy in the matchup"
+                help="Choose 3-10 strategies to compete"
             )
 
-        with col2:
-            strategy_b = st.selectbox(
-                "Select Strategy B",
-                options=strategy_options.keys(),
-                help="Second strategy in the matchup"
-            )
+            # Validation feedback
+            if selected_strategies:
+                n_selected = len(selected_strategies)
+                if n_selected < 3:
+                    st.warning(f"Selected {n_selected}/3 strategies minimum")
+                elif n_selected > 10:
+                    st.error(f"Selected {n_selected}/10 strategies maximum. Please deselect some.")
+                else:
+                    st.success(f"✓ {n_selected} strategies selected")
+        else:
+            # Head-to-head: two selectboxes
+            col1, col2 = st.columns(2)
+
+            with col1:
+                strategy_a = st.selectbox(
+                    "Select Strategy A",
+                    options=strategy_options.keys(),
+                    help="First strategy in the matchup"
+                )
+
+            with col2:
+                strategy_b = st.selectbox(
+                    "Select Strategy B",
+                    options=strategy_options.keys(),
+                    help="Second strategy in the matchup"
+                )
 
         # Match configuration
         st.subheader("Match Configuration")
@@ -489,15 +523,104 @@ elif page == "⚔️ Create Match":
             )
 
         with col2:
-            st.info(f"Estimated time: ~{n_sims * 0.5:.0f} seconds")
-
-        if st.button("🚀 Start Match", type="primary", use_container_width=True):
-            strat_a_id = strategy_options[strategy_a]
-            strat_b_id = strategy_options[strategy_b]
-
-            if strat_a_id == strat_b_id:
-                st.error("Please select two different strategies")
+            if is_n_way:
+                # N-way matches take longer due to complexity
+                est_time = n_sims * (len(selected_strategies) if 'selected_strategies' in locals() and selected_strategies else 3) * 0.3
+                st.info(f"Estimated time: ~{est_time:.0f} seconds")
             else:
+                st.info(f"Estimated time: ~{n_sims * 0.5:.0f} seconds")
+
+        # Validation and start button
+        can_start = False
+        if is_n_way:
+            if 'selected_strategies' in locals() and selected_strategies:
+                n_selected = len(selected_strategies)
+                can_start = 3 <= n_selected <= 10
+        else:
+            can_start = True
+
+        if st.button("🚀 Start Match", type="primary", use_container_width=True, disabled=not can_start):
+            if is_n_way:
+                # N-way match execution
+                strategy_ids = [strategy_options[name] for name in selected_strategies]
+
+                if len(set(strategy_ids)) != len(strategy_ids):
+                    st.error("Duplicate strategies selected")
+                elif len(strategy_ids) < 3:
+                    st.error("Please select at least 3 strategies")
+                elif len(strategy_ids) > 10:
+                    st.error("Maximum 10 strategies allowed")
+                else:
+                    # Progress bar
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+
+                    try:
+                        status_text.text(f"Running {len(strategy_ids)}-way match...")
+
+                        match_data, participant_results, sim_results = match_manager.run_n_way_match(
+                            strategy_ids,
+                            n_simulations=n_sims,
+                            progress_callback=lambda curr, total: progress_bar.progress(curr / total)
+                        )
+
+                        match_id = db.add_n_way_match(match_data, participant_results, sim_results)
+
+                        progress_bar.progress(1.0)
+                        status_text.text("Match complete!")
+
+                        st.success("✓ N-way match completed successfully!")
+                        st.balloons()
+
+                        # Display N-way results
+                        st.divider()
+                        st.subheader("🏆 Results")
+
+                        # Winner announcement
+                        winner = participant_results[0]  # Already sorted by placement
+                        st.success(f"🏆 Winner: **{winner['strategy_name']}**")
+
+                        # Podium display
+                        st.subheader("🥇 Final Standings")
+                        cols = st.columns(min(len(participant_results), 3))
+                        medals = ["🥇", "🥈", "🥉"]
+
+                        for i, participant in enumerate(participant_results[:3]):
+                            with cols[i]:
+                                medal = medals[i] if i < 3 else f"{i+1}th"
+                                st.metric(
+                                    f"{medal} {participant['strategy_name']}",
+                                    f"Avg Edge: {participant['avg_edge']:.2f}",
+                                    delta=f"{participant['wins']} wins"
+                                )
+
+                        # Full rankings table
+                        st.subheader("📊 Complete Rankings")
+                        rankings_data = []
+                        for i, p in enumerate(participant_results, 1):
+                            rankings_data.append({
+                                "Rank": i,
+                                "Strategy": p['strategy_name'],
+                                "Avg Edge": f"{p['avg_edge']:.2f}",
+                                "1st Place Finishes": p['wins'],
+                                "Points": f"{3 * p['wins'] if i == 1 else 0}"  # Simplified
+                            })
+                        st.dataframe(rankings_data, use_container_width=True)
+
+                        st.info(f"Match ID: {match_id} | {n_sims} simulations")
+
+                    except Exception as e:
+                        st.error(f"Error running match: {str(e)}")
+                        progress_bar.empty()
+                        status_text.empty()
+            else:
+                # Head-to-head match execution (existing logic)
+                strat_a_id = strategy_options[strategy_a]
+                strat_b_id = strategy_options[strategy_b]
+
+                if strat_a_id == strat_b_id:
+                    st.error("Please select two different strategies")
+                else:
                 # Progress bar
                 progress_bar = st.progress(0)
                 status_text = st.empty()

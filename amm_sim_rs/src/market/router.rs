@@ -254,13 +254,144 @@ impl OrderRouter {
         fair_price: f64,
         timestamp: u64,
     ) -> Vec<RoutedTrade> {
-        // Simplified: just use first two AMMs
-        // Full implementation would need recursive splitting
-        if amms.len() >= 2 {
-            self.route_to_two_amms(order, &mut amms[0..2], fair_price, timestamp)
-        } else {
-            self.route_to_single_amm(order, &mut amms[0], fair_price, timestamp)
+        const MAX_ITERATIONS: usize = 10;
+        const CONVERGENCE_THRESHOLD: f64 = 0.001; // 0.1% price gap
+        const MIN_AMOUNT: f64 = 0.0001;
+
+        let n = amms.len();
+        if n == 0 {
+            return Vec::new();
         }
+        if n == 1 {
+            return self.route_to_single_amm(order, &mut amms[0], fair_price, timestamp);
+        }
+        if n == 2 {
+            return self.route_to_two_amms(order, amms, fair_price, timestamp);
+        }
+
+        // Iterative convergence algorithm for n > 2 AMMs
+        let total_amount = if order.side == "buy" {
+            order.size // Total Y to spend
+        } else {
+            order.size / fair_price // Total X to sell
+        };
+
+        // Start with equal split
+        let mut allocations = vec![total_amount / (n as f64); n];
+
+        // Iteratively rebalance until convergence
+        for _iteration in 0..MAX_ITERATIONS {
+            // Compute marginal prices for each AMM after routing
+            let marginal_prices: Vec<f64> = (0..n)
+                .map(|i| {
+                    if order.side == "buy" {
+                        self.compute_marginal_price_buy(&amms[i], allocations[i])
+                    } else {
+                        self.compute_marginal_price_sell(&amms[i], allocations[i])
+                    }
+                })
+                .collect();
+
+            // Find pair with largest price discrepancy
+            let (idx1, idx2, max_gap) = self.find_max_price_gap(&marginal_prices);
+
+            // Check for convergence
+            if max_gap < CONVERGENCE_THRESHOLD {
+                break;
+            }
+
+            // Rebalance between the worst pair
+            let pair_total = allocations[idx1] + allocations[idx2];
+            let (new_alloc1, new_alloc2) = if order.side == "buy" {
+                self.split_buy_two_amms(&amms[idx1], &amms[idx2], pair_total)
+            } else {
+                self.split_sell_two_amms(&amms[idx1], &amms[idx2], pair_total)
+            };
+
+            allocations[idx1] = new_alloc1;
+            allocations[idx2] = new_alloc2;
+        }
+
+        // Execute trades with final allocations
+        let mut trades = Vec::new();
+        for (i, amm) in amms.iter_mut().enumerate() {
+            let amount = allocations[i];
+            if amount < MIN_AMOUNT {
+                continue;
+            }
+
+            if order.side == "buy" {
+                if let Some(result) = amm.execute_buy_x_with_y(amount, timestamp) {
+                    trades.push(RoutedTrade {
+                        amm_name: amm.name.clone(),
+                        amount_y: amount,
+                        amount_x: result.trade_info.amount_x.to_f64(),
+                        amm_buys_x: false,
+                    });
+                }
+            } else {
+                if let Some(result) = amm.execute_buy_x(amount, timestamp) {
+                    trades.push(RoutedTrade {
+                        amm_name: amm.name.clone(),
+                        amount_y: result.trade_info.amount_y.to_f64(),
+                        amount_x: amount,
+                        amm_buys_x: true,
+                    });
+                }
+            }
+        }
+
+        trades
+    }
+
+    /// Compute marginal price for buying X (trader perspective) after spending amount_y
+    fn compute_marginal_price_buy(&self, amm: &CFMM, amount_y: f64) -> f64 {
+        let (x, y) = amm.reserves();
+        let fee = amm.fees().ask_fee.to_f64();
+        let gamma = 1.0 - fee;
+
+        // After trade: y' = y + gamma * amount_y
+        // marginal price = dy/dx at the new point
+        // For xy=k: dy/dx = -y/x, so marginal price = y'/x'
+        let y_new = y + gamma * amount_y;
+        let k = x * y;
+        let x_new = k / y_new;
+
+        y_new / x_new
+    }
+
+    /// Compute marginal price for selling X (trader perspective) after selling amount_x
+    fn compute_marginal_price_sell(&self, amm: &CFMM, amount_x: f64) -> f64 {
+        let (x, y) = amm.reserves();
+        let fee = amm.fees().bid_fee.to_f64();
+        let gamma = 1.0 - fee;
+
+        // After trade: x' = x + gamma * amount_x
+        // marginal price = dy/dx at the new point
+        let x_new = x + gamma * amount_x;
+        let k = x * y;
+        let y_new = k / x_new;
+
+        y_new / x_new
+    }
+
+    /// Find the pair of AMMs with the largest price gap
+    /// Returns (index1, index2, gap_ratio)
+    fn find_max_price_gap(&self, prices: &[f64]) -> (usize, usize, f64) {
+        let mut max_gap = 0.0;
+        let mut best_pair = (0, 1);
+
+        for i in 0..prices.len() {
+            for j in (i + 1)..prices.len() {
+                let gap = (prices[i] - prices[j]).abs() / prices[i].max(prices[j]);
+                if gap > max_gap {
+                    max_gap = gap;
+                    best_pair = (i, j);
+                }
+            }
+        }
+
+        (best_pair.0, best_pair.1, max_gap)
     }
 
     /// Route multiple orders.

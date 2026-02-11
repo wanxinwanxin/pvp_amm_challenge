@@ -12,7 +12,7 @@ pub mod simulation;
 
 use pyo3::prelude::*;
 
-use crate::simulation::runner::{run_simulations_parallel, SimulationBatchConfig};
+use crate::simulation::runner::{run_simulations_parallel, run_n_way_simulations_parallel, SimulationBatchConfig, NWaySimulationBatchConfig};
 use crate::types::config::SimulationConfig;
 use crate::types::result::{BatchSimulationResult, LightweightSimResult};
 
@@ -65,10 +65,37 @@ fn run_single(
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
 }
 
+/// Run multiple simulations in parallel with n strategies (n-way matches).
+///
+/// # Arguments
+/// * `strategy_bytecodes` - List of compiled bytecodes for all strategies
+/// * `configs` - List of simulation configurations (one per simulation)
+/// * `n_workers` - Number of parallel workers (0 = auto-detect)
+///
+/// # Returns
+/// BatchSimulationResult containing all simulation results
+#[pyfunction]
+#[pyo3(signature = (strategy_bytecodes, configs, n_workers = 0))]
+fn run_batch_n_way(
+    strategy_bytecodes: Vec<Vec<u8>>,
+    configs: Vec<SimulationConfig>,
+    n_workers: usize,
+) -> PyResult<BatchSimulationResult> {
+    let batch_config = NWaySimulationBatchConfig {
+        strategy_bytecodes,
+        configs,
+        n_workers: if n_workers == 0 { None } else { Some(n_workers) },
+    };
+
+    run_n_way_simulations_parallel(batch_config)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+}
+
 /// Python module definition
 #[pymodule]
 fn amm_sim_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(run_batch_n_way, m)?)?;
     m.add_function(wrap_pyfunction!(run_single, m)?)?;
     m.add_class::<SimulationConfig>()?;
     m.add_class::<LightweightSimResult>()?;

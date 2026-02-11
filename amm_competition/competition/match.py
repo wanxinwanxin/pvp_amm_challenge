@@ -229,3 +229,213 @@ class MatchRunner:
             total_edge_b=total_edge_b,
             simulation_results=simulation_results,
         )
+
+
+@dataclass
+class NWayMatchResult:
+    """Result of an n-way match with multiple strategies."""
+    strategies: list[str]  # Strategy names in consistent order
+    placements: dict[str, list[int]]  # strategy_name -> list of placements per simulation
+    avg_placements: dict[str, float]  # strategy_name -> average placement
+    edges: dict[str, Decimal]  # strategy_name -> total edge
+    pnls: dict[str, Decimal]  # strategy_name -> total pnl
+    first_place_counts: dict[str, int]  # strategy_name -> number of 1st place finishes
+    simulation_results: list[LightweightSimResult] = field(default_factory=list)
+
+    @property
+    def winner(self) -> Optional[str]:
+        """Strategy with most 1st place finishes (tiebreak by avg edge)."""
+        if not self.first_place_counts:
+            return None
+
+        max_wins = max(self.first_place_counts.values())
+        winners = [s for s, w in self.first_place_counts.items() if w == max_wins]
+
+        if len(winners) == 1:
+            return winners[0]
+
+        # Tiebreak by average edge
+        return max(winners, key=lambda s: self.edges[s] / len(self.simulation_results))
+
+    def get_placement(self, strategy_name: str) -> list[int]:
+        """Get placement history for a strategy."""
+        return self.placements.get(strategy_name, [])
+
+    def get_points(self, strategy_name: str) -> int:
+        """Calculate points using 3/2/1/0 scoring system."""
+        placements = self.get_placement(strategy_name)
+        points = 0
+        for place in placements:
+            if place == 1:
+                points += 3
+            elif place == 2:
+                points += 2
+            elif place == 3:
+                points += 1
+        return points
+
+
+class NWayMatchRunner:
+    """Runs n-way matches with 3+ strategies using Rust simulation engine."""
+
+    def __init__(
+        self,
+        *,
+        n_simulations: int,
+        config: SimulationConfig,
+        n_workers: int,
+        variance: HyperparameterVariance,
+    ):
+        self.n_simulations = n_simulations
+        self.base_config = config
+        self.n_workers = n_workers
+        self.variance = variance
+
+    def _build_configs(self) -> list[amm_sim_rs.SimulationConfig]:
+        """Build simulation configs with optional variance (same as MatchRunner)."""
+        import numpy as np
+
+        configs = []
+        for i in range(self.n_simulations):
+            rng = np.random.default_rng(seed=i)
+
+            retail_mean_size = (
+                rng.uniform(self.variance.retail_mean_size_min, self.variance.retail_mean_size_max)
+                if self.variance.vary_retail_mean_size
+                else self.base_config.retail_mean_size
+            )
+            retail_arrival_rate = (
+                rng.uniform(self.variance.retail_arrival_rate_min, self.variance.retail_arrival_rate_max)
+                if self.variance.vary_retail_arrival_rate
+                else self.base_config.retail_arrival_rate
+            )
+            gbm_sigma = (
+                rng.uniform(self.variance.gbm_sigma_min, self.variance.gbm_sigma_max)
+                if self.variance.vary_gbm_sigma
+                else self.base_config.gbm_sigma
+            )
+
+            cfg = amm_sim_rs.SimulationConfig(
+                n_steps=self.base_config.n_steps,
+                initial_price=self.base_config.initial_price,
+                initial_x=self.base_config.initial_x,
+                initial_y=self.base_config.initial_y,
+                gbm_mu=self.base_config.gbm_mu,
+                gbm_sigma=gbm_sigma,
+                gbm_dt=self.base_config.gbm_dt,
+                retail_arrival_rate=retail_arrival_rate,
+                retail_mean_size=retail_mean_size,
+                retail_size_sigma=self.base_config.retail_size_sigma,
+                retail_buy_prob=self.base_config.retail_buy_prob,
+                seed=i,
+            )
+            configs.append(cfg)
+        return configs
+
+    def run_match(
+        self,
+        strategies: list[EVMStrategyAdapter],
+        store_results: bool = False,
+    ) -> NWayMatchResult:
+        """
+        Run a complete n-way match with multiple strategies.
+
+        Args:
+            strategies: List of 3-10 strategy adapters
+            store_results: Whether to store detailed simulation results
+
+        Returns:
+            NWayMatchResult with placement-based rankings
+        """
+        if len(strategies) < 3:
+            raise ValueError("N-way matches require at least 3 strategies")
+        if len(strategies) > 10:
+            raise ValueError("N-way matches support maximum 10 strategies")
+
+        # Get strategy names
+        strategy_names = [s.get_name() for s in strategies]
+
+        # Build configs
+        configs = self._build_configs()
+
+        # Extract bytecodes
+        bytecodes = [list(s._bytecode) for s in strategies]
+
+        # Run simulations in Rust
+        batch_result = amm_sim_rs.run_batch_n_way(
+            bytecodes,
+            configs,
+            self.n_workers,
+        )
+
+        # Initialize tracking structures
+        placements = {name: [] for name in strategy_names}
+        edges = {name: Decimal("0") for name in strategy_names}
+        pnls = {name: Decimal("0") for name in strategy_names}
+        first_place_counts = {name: 0 for name in strategy_names}
+        simulation_results = []
+
+        # Process each simulation result
+        for rust_result in batch_result.results:
+            # Sort strategies by edge to determine placements
+            strategy_edges = []
+            for i, strategy_name in enumerate(strategy_names):
+                rust_name = f"strategy_{i}"
+                edge = rust_result.edges.get(rust_name, 0.0)
+                pnl = rust_result.pnl.get(rust_name, 0.0)
+                strategy_edges.append((strategy_name, edge, pnl))
+
+            # Sort by edge (descending) to get placements
+            strategy_edges.sort(key=lambda x: x[1], reverse=True)
+
+            # Assign placements
+            for placement, (strategy_name, edge, pnl) in enumerate(strategy_edges, start=1):
+                placements[strategy_name].append(placement)
+                edges[strategy_name] += Decimal(str(edge))
+                pnls[strategy_name] += Decimal(str(pnl))
+
+                if placement == 1:
+                    first_place_counts[strategy_name] += 1
+
+            if store_results:
+                # Convert Rust result to Python dataclass
+                steps = [
+                    LightweightStepResult(
+                        timestamp=s.timestamp,
+                        fair_price=s.fair_price,
+                        spot_prices=s.spot_prices,
+                        pnls=s.pnls,
+                        fees=s.fees,
+                    )
+                    for s in rust_result.steps
+                ]
+
+                sim_result = LightweightSimResult(
+                    seed=rust_result.seed,
+                    strategies=rust_result.strategies,
+                    pnl={k: Decimal(str(v)) for k, v in rust_result.pnl.items()},
+                    edges={k: Decimal(str(v)) for k, v in rust_result.edges.items()},
+                    initial_fair_price=rust_result.initial_fair_price,
+                    initial_reserves=rust_result.initial_reserves,
+                    steps=steps,
+                    arb_volume_y=rust_result.arb_volume_y,
+                    retail_volume_y=rust_result.retail_volume_y,
+                    average_fees=rust_result.average_fees,
+                )
+                simulation_results.append(sim_result)
+
+        # Calculate average placements
+        avg_placements = {
+            name: sum(places) / len(places)
+            for name, places in placements.items()
+        }
+
+        return NWayMatchResult(
+            strategies=strategy_names,
+            placements=placements,
+            avg_placements=avg_placements,
+            edges=edges,
+            pnls=pnls,
+            first_place_counts=first_place_counts,
+            simulation_results=simulation_results,
+        )

@@ -217,6 +217,165 @@ impl SimulationEngine {
             average_fees,
         })
     }
+
+    /// Run a complete n-way simulation with multiple strategies.
+    pub fn run_n_way(
+        &mut self,
+        strategies: Vec<EVMStrategy>,
+    ) -> Result<LightweightSimResult, SimulationError> {
+        if strategies.is_empty() {
+            return Err(SimulationError::InvalidConfig(
+                "At least one strategy required".to_string(),
+            ));
+        }
+
+        let seed = self.config.seed.unwrap_or(0);
+
+        // Initialize price process
+        let mut price_process = GBMPriceProcess::new(
+            self.config.initial_price,
+            self.config.gbm_mu,
+            self.config.gbm_sigma,
+            self.config.gbm_dt,
+            Some(seed),
+        );
+
+        // Initialize retail trader
+        let mut retail_trader = RetailTrader::new(
+            self.config.retail_arrival_rate,
+            self.config.retail_mean_size,
+            self.config.retail_size_sigma,
+            self.config.retail_buy_prob,
+            Some(seed + 1),
+        );
+
+        let arbitrageur = Arbitrageur::new();
+        let router = OrderRouter::new();
+
+        // Create AMMs for all strategies with unique names
+        let mut amms: Vec<CFMM> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+
+        for (idx, strategy) in strategies.into_iter().enumerate() {
+            let name = format!("strategy_{}", idx);
+            let mut amm = CFMM::new(strategy, self.config.initial_x, self.config.initial_y);
+            amm.name = name.clone();
+            amm.initialize()
+                .map_err(|e| SimulationError::EVMError(e.to_string()))?;
+            amms.push(amm);
+            names.push(name);
+        }
+
+        // Record initial state
+        let initial_fair_price = price_process.current_price();
+        let mut initial_reserves = HashMap::new();
+        for (amm, name) in amms.iter().zip(names.iter()) {
+            initial_reserves.insert(name.clone(), amm.reserves());
+        }
+
+        // Track edge per strategy
+        let mut edges: HashMap<String, f64> = HashMap::new();
+        for name in &names {
+            edges.insert(name.clone(), 0.0);
+        }
+
+        // Run simulation steps
+        let mut steps = Vec::with_capacity(self.config.n_steps as usize);
+
+        // Track cumulative volumes and fees
+        let mut arb_volume_y: HashMap<String, f64> = HashMap::new();
+        let mut retail_volume_y: HashMap<String, f64> = HashMap::new();
+        let mut cumulative_bid_fees: HashMap<String, f64> = HashMap::new();
+        let mut cumulative_ask_fees: HashMap<String, f64> = HashMap::new();
+        for name in &names {
+            arb_volume_y.insert(name.clone(), 0.0);
+            retail_volume_y.insert(name.clone(), 0.0);
+            cumulative_bid_fees.insert(name.clone(), 0.0);
+            cumulative_ask_fees.insert(name.clone(), 0.0);
+        }
+
+        for t in 0..self.config.n_steps {
+            // 1. Generate new fair price
+            let fair_price = price_process.step();
+
+            // 2. Arbitrageur extracts profit from each AMM
+            for amm in amms.iter_mut() {
+                if let Some(arb_result) = arbitrageur.execute_arb(amm, fair_price, t as u64) {
+                    *arb_volume_y.get_mut(&arb_result.amm_name).unwrap() += arb_result.amount_y;
+                    let entry = edges.entry(arb_result.amm_name).or_insert(0.0);
+                    *entry += -arb_result.profit;
+                }
+            }
+
+            // 3. Retail orders arrive and get routed across all AMMs
+            let orders = retail_trader.generate_orders();
+            let routed_trades = router.route_orders(&orders, &mut amms, fair_price, t as u64);
+            for trade in routed_trades {
+                *retail_volume_y.get_mut(&trade.amm_name).unwrap() += trade.amount_y;
+                let trade_edge = if trade.amm_buys_x {
+                    trade.amount_x * fair_price - trade.amount_y
+                } else {
+                    trade.amount_y - trade.amount_x * fair_price
+                };
+                let entry = edges.entry(trade.amm_name).or_insert(0.0);
+                *entry += trade_edge;
+            }
+
+            // 4. Capture step result and accumulate fees
+            let step = capture_step(
+                t,
+                fair_price,
+                &amms,
+                &names,
+                &initial_reserves,
+                initial_fair_price,
+            );
+            for name in &names {
+                if let Some((bid_fee, ask_fee)) = step.fees.get(name) {
+                    *cumulative_bid_fees.get_mut(name).unwrap() += bid_fee;
+                    *cumulative_ask_fees.get_mut(name).unwrap() += ask_fee;
+                }
+            }
+            steps.push(step);
+        }
+
+        // Calculate final PnL
+        let final_fair_price = price_process.current_price();
+        let mut pnl = HashMap::new();
+
+        // Calculate average fees
+        let n_steps = self.config.n_steps as f64;
+        let mut average_fees: HashMap<String, (f64, f64)> = HashMap::new();
+        for name in &names {
+            let avg_bid = cumulative_bid_fees.get(name).unwrap() / n_steps;
+            let avg_ask = cumulative_ask_fees.get(name).unwrap() / n_steps;
+            average_fees.insert(name.clone(), (avg_bid, avg_ask));
+        }
+
+        for (amm, name) in amms.iter().zip(names.iter()) {
+            let (init_x, init_y) = initial_reserves.get(name).unwrap();
+            let init_value = init_x * initial_fair_price + init_y;
+            let (final_x, final_y) = amm.reserves();
+            let (fees_x, fees_y) = amm.accumulated_fees();
+            let reserves_value = final_x * final_fair_price + final_y;
+            let fees_value = fees_x * final_fair_price + fees_y;
+            let final_value = reserves_value + fees_value;
+            pnl.insert(name.clone(), final_value - init_value);
+        }
+
+        Ok(LightweightSimResult {
+            seed,
+            strategies: names,
+            pnl,
+            edges,
+            initial_fair_price,
+            initial_reserves,
+            steps,
+            arb_volume_y,
+            retail_volume_y,
+            average_fees,
+        })
+    }
 }
 
 fn capture_step(
