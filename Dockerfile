@@ -1,37 +1,82 @@
-# Dockerfile for PVP AMM Challenge - Railway Deployment
+# ============================================================================
+# Stage 1: Rust Builder (with dependency caching)
+# ============================================================================
+FROM rust:1.75-slim AS rust-builder
 
-FROM python:3.11-slim
+WORKDIR /build
 
-# Install system dependencies
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
-    curl \
-    build-essential \
-    git \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust (needed for amm_sim_rs)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+# Copy only dependency manifests first (cached layer)
+COPY amm_sim_rs/Cargo.toml amm_sim_rs/Cargo.lock* ./amm_sim_rs/
+COPY amm_sim_rs/pyproject.toml ./amm_sim_rs/
 
-# Set working directory
+# Create dummy source to build dependencies
+RUN mkdir -p amm_sim_rs/src && \
+    echo "fn main() {}" > amm_sim_rs/src/lib.rs
+
+# Pre-build dependencies (this layer caches 249 crates)
+RUN cd amm_sim_rs && cargo build --profile release-ci
+
+# Remove dummy source
+RUN rm -rf amm_sim_rs/src
+
+# Copy real source code
+COPY amm_sim_rs/src ./amm_sim_rs/src
+
+# Build application (dependencies already compiled)
+RUN cd amm_sim_rs && cargo build --profile release-ci
+
+# ============================================================================
+# Stage 2: Python Builder (wheel creation)
+# ============================================================================
+FROM python:3.11-slim AS python-builder
+
+WORKDIR /build
+
+# Install maturin
+RUN pip install --no-cache-dir maturin
+
+# Copy built Rust artifacts from Stage 1
+COPY --from=rust-builder /build/amm_sim_rs ./amm_sim_rs
+
+# Build wheel from pre-compiled Rust library
+RUN cd amm_sim_rs && maturin build --profile release-ci --bindings pyo3
+
+# ============================================================================
+# Stage 3: Runtime (minimal final image)
+# ============================================================================
+FROM python:3.11-slim
+
 WORKDIR /app
 
-# Copy project files
-COPY . .
+# Install minimal runtime dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies for the base project
-RUN pip install --no-cache-dir --upgrade pip
-RUN pip install --no-cache-dir numpy  # Pre-install numpy for faster build
+# Copy and install wheel from builder
+COPY --from=python-builder /build/amm_sim_rs/target/wheels/*.whl /tmp/
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir /tmp/*.whl && \
+    rm -rf /tmp/*.whl
 
-# Build and install the Rust simulation engine
-RUN cd amm_sim_rs && \
-    pip install --no-cache-dir maturin && \
-    maturin build --profile release-ci && \
-    pip install --no-cache-dir target/wheels/*.whl
-
-# Install Python package and PVP dependencies
-RUN pip install --no-cache-dir -e .
+# Install Python dependencies (cached layer)
+COPY requirements-pvp.txt .
 RUN pip install --no-cache-dir -r requirements-pvp.txt
+
+# Copy application code (changes frequently - last)
+COPY pyproject.toml setup.py* ./
+COPY amm_competition/ ./amm_competition/
+COPY pvp_app/ ./pvp_app/
+COPY start.sh ./
+RUN chmod +x start.sh
+
+# Install the application package
+RUN pip install --no-cache-dir -e .
 
 # Create data directory
 RUN mkdir -p /app/data
@@ -42,5 +87,5 @@ EXPOSE 8501
 # Health check
 HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
 
-# Run Streamlit app via startup script
+# Run application
 CMD ["./start.sh"]
