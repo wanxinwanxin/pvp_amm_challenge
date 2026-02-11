@@ -36,11 +36,11 @@ RUN pip install --no-cache-dir -r requirements-pvp.txt
 # Create data directory
 RUN mkdir -p /app/data
 
-# Expose Streamlit port
+# Expose Streamlit port (Railway will use dynamic $PORT)
 EXPOSE 8501
 
-# Health check
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+# Note: Railway handles health checks via railway.toml
+# No HEALTHCHECK needed here to avoid port conflicts
 
 # Run Streamlit app via startup script
 CMD ["./start.sh"]
