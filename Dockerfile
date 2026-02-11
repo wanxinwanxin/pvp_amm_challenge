@@ -39,7 +39,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy project files (excluding Rust source since we have the wheel)
-COPY requirements.txt requirements-pvp.txt pyproject.toml setup.py ./
+COPY requirements.txt requirements-pvp.txt pyproject.toml ./
 COPY amm_competition ./amm_competition
 COPY contracts ./contracts
 COPY pvp_app ./pvp_app
