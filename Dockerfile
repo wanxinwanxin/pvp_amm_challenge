@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir numpy  # Pre-install numpy for faster build
 # Build and install the Rust simulation engine
 RUN cd amm_sim_rs && \
     pip install --no-cache-dir maturin && \
-    maturin build --release && \
+    maturin build --profile release-ci && \
     pip install --no-cache-dir target/wheels/*.whl
 
 # Install Python package and PVP dependencies

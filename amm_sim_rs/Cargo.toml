@@ -41,3 +41,10 @@ harness = false
 lto = true
 codegen-units = 1
 opt-level = 3
+
+# CI profile - balanced for deployment builds
+[profile.release-ci]
+inherits = "release"
+lto = "thin"         # Thin LTO: 50% faster build, ~3-5% slower runtime
+codegen-units = 4    # Parallel codegen: 30% faster build, ~2-3% slower runtime
+opt-level = 2        # Good optimization: 15% faster build, ~2-4% slower runtime

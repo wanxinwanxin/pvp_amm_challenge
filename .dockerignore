@@ -1,0 +1,41 @@
+# Rust build artifacts (380MB saved)
+amm_sim_rs/target/
+**/*.so
+**/*.dylib
+**/*.whl
+
+# Python environments (477MB saved)
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+.tox/
+
+# Git & IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+
+# Documentation (except README)
+*.md
+!README.md
+
+# CI/CD
+.github/
+
+# OS files
+.DS_Store
+Thumbs.db
