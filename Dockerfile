@@ -25,8 +25,9 @@ RUN cd amm_sim_rs && cargo build --profile release-ci
 # Remove dummy source
 RUN rm -rf amm_sim_rs/src amm_sim_rs/benches
 
-# Copy real source code
+# Copy real source code (including benches for Cargo manifest)
 COPY amm_sim_rs/src ./amm_sim_rs/src
+COPY amm_sim_rs/benches ./amm_sim_rs/benches
 
 # Build application (dependencies already compiled)
 RUN cd amm_sim_rs && cargo build --profile release-ci
