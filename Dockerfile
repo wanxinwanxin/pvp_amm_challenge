@@ -1,7 +1,7 @@
 # ============================================================================
 # Stage 1: Rust Builder (with dependency caching)
 # ============================================================================
-FROM rust:1.83-slim AS rust-builder
+FROM rustlang/rust:nightly-slim AS rust-builder
 
 WORKDIR /build
 
